@@ -4,6 +4,10 @@
 # no separate config to keep in sync.
 
 SHELL := /bin/bash
+# Without pipefail a recipe's exit status is the LAST command in the pipe, so
+# `api.sh | show.py` reported success even when api.sh failed. Every read target
+# is such a pipe, so this line is load-bearing, not hygiene.
+.SHELLFLAGS := -o pipefail -c
 COMPOSE := docker compose
 
 # Read .env for targets that need values in make itself (not just in compose).
@@ -26,8 +30,8 @@ SHIM_SCRIPT ?= scripts/token-shim.py
 
 help: ## Show this help
 	@printf '\nHindsight stack\n\n'
-	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+	@{ grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'; } || true
 	@printf '\n'
 
 preflight: ## Check config, Docker, and shim reachability before starting
@@ -74,52 +78,42 @@ BANK ?= test
 
 check-llm: ## Do one real round trip to the LLM and print the actual error
 	@bash scripts/api.sh POST /v1/default/banks/$(BANK)/health/llm '{}' \
-	  | python3 -m json.tool
+	  | python3 scripts/show.py json
 
 retain: ## Store a memory synchronously. TEXT="..." [BANK=test]
 	@test -n "$(TEXT)" || { echo 'usage: make retain TEXT="something to remember"'; exit 1; }
 	@bash scripts/api.sh POST /v1/default/banks/$(BANK)/memories \
 	  "$$(python3 scripts/mkbody.py retain "$(TEXT)")" \
-	  | python3 -m json.tool
+	  | python3 scripts/show.py json
 
 recall: ## Query stored memories. QUERY="..." [BANK=test]
 	@test -n "$(QUERY)" || { echo 'usage: make recall QUERY="what do you know?"'; exit 1; }
 	@bash scripts/api.sh POST /v1/default/banks/$(BANK)/memories/recall \
 	  "$$(python3 scripts/mkbody.py recall "$(QUERY)")" \
-	  | python3 -m json.tool
+	  | python3 scripts/show.py json
 
 find: ## Find memories and print their ids. QUERY="..." [BANK=test]
 	@test -n "$(QUERY)" || { echo 'usage: make find QUERY="stale claim"'; exit 1; }
 	@bash scripts/api.sh POST /v1/default/banks/$(BANK)/memories/recall \
 	  "$$(python3 scripts/mkbody.py recall "$(QUERY)")" \
-	  | python3 -c "import json,sys; d=json.load(sys.stdin); \
-	      [print(f\"{r['id']}  [{r['type']}]  {r['text'][:96]}\") for r in d.get('results',[])] \
-	      or print('no results')"
+	  | python3 scripts/show.py find
 
 invalidate: ## Soft-retire a memory. ID=<uuid> REASON="why" [BANK=test]
 	@test -n "$(ID)" || { echo 'usage: make invalidate ID=<uuid> REASON="why it is wrong"'; exit 1; }
 	@test -n "$(REASON)" || { echo 'REASON is required -- an invalidation without a reason is unreadable later'; exit 1; }
 	@bash scripts/api.sh PATCH /v1/default/banks/$(BANK)/memories/$(ID) \
 	  "$$(python3 -c "import json,sys; print(json.dumps(dict(state='invalidated', reason=sys.argv[1])))" "$(REASON)")" \
-	  | python3 -c "import json,sys; d=json.load(sys.stdin); \
-	      print('invalidated', d.get('id')); \
-	      print('  at    :', d.get('invalidated_at')); \
-	      print('  reason:', d.get('invalidation_reason')); \
-	      print('  text  :', str(d.get('text'))[:90])"
+	  | python3 scripts/show.py invalidate
 
 recall-text: ## Like recall, but print just the matched memory lines
 	@test -n "$(QUERY)" || { echo 'usage: make recall-text QUERY="..."'; exit 1; }
 	@bash scripts/api.sh POST /v1/default/banks/$(BANK)/memories/recall \
 	  "$$(python3 scripts/mkbody.py recall "$(QUERY)")" \
-	  | python3 -c "import json,sys; d=json.load(sys.stdin); \
-	      print('no results') if not d.get('results') else \
-	      [print(f\"[{r['type']}] {r['text']}\") for r in d['results']]"
+	  | python3 scripts/show.py recall-text
 
 banks: ## List memory banks and their fact counts
 	@bash scripts/api.sh GET /v1/default/banks \
-	  | python3 -c "import json,sys; \
-	      [print(f\"  {b['bank_id']:<20} {b['fact_count']:>5} facts   last write {b.get('last_write_at','-')}\") \
-	       for b in json.load(sys.stdin)['banks']]"
+	  | python3 scripts/show.py banks
 
 # Imports default to `work`, not the scratch BANK the read targets use -- an
 # import into `test` is never what you meant.
@@ -155,11 +149,12 @@ serve-on: ## Expose the dashboard + API to your tailnet over HTTPS
 serve-status: ## Show what is currently exposed to the tailnet, and to whom
 	@tailscale serve status 2>/dev/null || echo "no serve config"
 	@printf '\nTailnet devices that can reach it:\n'
-	@tailscale status 2>/dev/null | awk 'NF{printf "  %s  %s\n", $$2, $$5" "$$6" "$$7}'
+	@{ tailscale status 2>/dev/null | awk 'NF{printf "  %s  %s\n", $$2, $$5" "$$6" "$$7}'; } || true
 	@printf '\nFunnel (public internet) capable: '
-	@tailscale status --json 2>/dev/null | python3 -c "import json,sys; \
+	@{ tailscale status --json 2>/dev/null | python3 -c "import json,sys; \
 	  caps=json.load(sys.stdin).get('Self',{}).get('Capabilities') or []; \
-	  print('YES -- review this' if any('funnel' in str(c).lower() for c in caps) else 'no')"
+	  print('YES -- review this' if any('funnel' in str(c).lower() for c in caps) else 'no')"; } \
+	  || echo 'unknown (tailscale not available)'
 
 api-key: ## Print the API key from .env (add | pbcopy to copy it)
 	@test -f .env || { echo "no .env"; exit 1; }

@@ -283,6 +283,7 @@ docs/CURATION.md            retiring stale memories, and writing ones that age
 docs/TOKEN-SHIM.md          the shim, its refresh model, and a local overlay
 docs/REMOTE-ACCESS.md       reaching the stack from your other devices
 scripts/api.sh              one API call, host-first with in-container fallback
+scripts/show.py             renders a response; an empty stream is a failure
 docs/REGISTRY.md            why the Postgres image is not upstream's
 docs/SLIM.md                switching to the 500 MB image
 docs/INSTALL-REFERENCE.md   upstream install doc, kept verbatim for reference

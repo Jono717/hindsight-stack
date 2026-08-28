@@ -10,6 +10,13 @@
 # full payload -- so this tries the host first and silently falls back to running
 # the same request inside the container, which no host proxy can touch.
 #
+# WELL-FORMED IS NOT THE SAME AS SUCCESSFUL. Parsing as JSON used to be the only
+# test, so an HTTP 401, a FastAPI {"detail": ...} and a proxy's
+# {"type":"error", ...} envelope all counted as success. Callers then read a body
+# with no `results` key and reported "no results", turning a connection refusal
+# into a confident empty answer. The status code is now checked, and error-shaped
+# bodies are rejected, so a failure is always a non-zero exit.
+#
 # Prints the response body on stdout. Exits non-zero if neither path works.
 set -uo pipefail
 
@@ -33,44 +40,109 @@ fi
 AUTH=()
 [[ -n "$KEY" ]] && AUTH=(-H "Authorization: Bearer ${KEY}")
 
-valid_json() { python3 -c 'import json,sys; json.load(sys.stdin)' <"$1" 2>/dev/null; }
+# Usable means: parses as JSON, AND is not an error envelope. Anything an
+# intermediary or the API itself returns to signal failure must fail here, or the
+# caller reports it as data.
+usable_json() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if isinstance(d, dict):
+    # Proxy / gateway envelope, FastAPI validation error, and the common
+    # {"error": ...} shape. A bare {"detail": null} is not an error.
+    if d.get("type") == "error" or d.get("error") is not None:
+        sys.exit(2)
+    if d.get("detail") is not None and "results" not in d:
+        sys.exit(2)
+sys.exit(0)
+PY
+}
+
+# Message worth showing the user, pulled out of whatever error shape came back.
+error_message() {
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(open(sys.argv[1]).read()[:400]); sys.exit(0)
+if isinstance(d, dict):
+    e = d.get("error")
+    if isinstance(e, dict):
+        print(e.get("message") or json.dumps(e)[:400]); sys.exit(0)
+    if e:
+        print(str(e)[:400]); sys.exit(0)
+    if d.get("detail") is not None:
+        print(json.dumps(d["detail"])[:400]); sys.exit(0)
+print(json.dumps(d)[:400])
+PY
+}
 
 tmp=$(mktemp) || exit 1
-trap 'rm -f "$tmp"' EXIT
+code_file=$(mktemp) || exit 1
+trap 'rm -f "$tmp" "$code_file"' EXIT
 
-# Attempt 1: from the host.
-if [[ -n "$BODY" ]]; then
-  printf '%s' "$BODY" | curl -sS -m 300 -X "$METHOD" \
-    "http://localhost:${PORT}${PATH_}" \
-    "${AUTH[@]}" \
-    -H 'Content-Type: application/json' --data-binary @- >"$tmp" 2>/dev/null
-else
-  curl -sS -m 300 -X "$METHOD" "http://localhost:${PORT}${PATH_}" "${AUTH[@]}" >"$tmp" 2>/dev/null
+# -w writes the status to its own file: the body stays clean, and a non-2xx is
+# visible even when the API returns a perfectly well-formed error document.
+attempt_host() {
+  if [[ -n "$BODY" ]]; then
+    printf '%s' "$BODY" | curl -sS -m 300 -X "$METHOD" \
+      "http://localhost:${PORT}${PATH_}" \
+      "${AUTH[@]}" \
+      -H 'Content-Type: application/json' --data-binary @- \
+      -o "$tmp" -w '%{http_code}' >"$code_file" 2>/dev/null
+  else
+    curl -sS -m 300 -X "$METHOD" "http://localhost:${PORT}${PATH_}" "${AUTH[@]}" \
+      -o "$tmp" -w '%{http_code}' >"$code_file" 2>/dev/null
+  fi
+}
+
+attempt_container() {
+  if [[ -n "$BODY" ]]; then
+    printf '%s' "$BODY" | docker compose exec -T hindsight \
+      curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" \
+      "${AUTH[@]}" \
+      -H 'Content-Type: application/json' --data-binary @- \
+      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null \
+      | { body=$(sed '$d'); code=$(tail -n1); printf '%s' "$body" >"$tmp"; printf '%s' "$code" >"$code_file"; }
+  else
+    docker compose exec -T hindsight \
+      curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" "${AUTH[@]}" \
+      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null \
+      | { body=$(sed '$d'); code=$(tail -n1); printf '%s' "$body" >"$tmp"; printf '%s' "$code" >"$code_file"; }
+  fi
+}
+
+status_ok() {
+  local c
+  c=$(cat "$code_file" 2>/dev/null)
+  [[ "$c" =~ ^2[0-9][0-9]$ ]]
+}
+
+for attempt in attempt_host attempt_container; do
+  : >"$tmp"; : >"$code_file"
+  "$attempt"
+  if [[ -s "$tmp" ]] && status_ok && usable_json "$tmp"; then
+    cat "$tmp"
+    exit 0
+  fi
+done
+
+# Both paths failed. Say why, in the terms the caller needs: a status code, or the
+# message out of the error body. Never print a partial body as though it were data.
+code=$(cat "$code_file" 2>/dev/null)
+echo "api call FAILED: $METHOD $PATH_" >&2
+[[ -n "$code" && "$code" != "000" ]] && echo "  http status: $code" >&2
+if [[ -s "$tmp" ]]; then
+  msg=$(error_message "$tmp")
+  [[ -n "$msg" ]] && echo "  response: $msg" >&2
 fi
-
-if [[ -s "$tmp" ]] && valid_json "$tmp"; then
-  cat "$tmp"
-  exit 0
-fi
-
-# Attempt 2: inside the container, out of reach of any host proxy.
-if [[ -n "$BODY" ]]; then
-  printf '%s' "$BODY" | docker compose exec -T hindsight \
-    curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" \
-    "${AUTH[@]}" \
-    -H 'Content-Type: application/json' --data-binary @- >"$tmp" 2>/dev/null
-else
-  docker compose exec -T hindsight \
-    curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" "${AUTH[@]}" >"$tmp" 2>/dev/null
-fi
-
-if [[ -s "$tmp" ]] && valid_json "$tmp"; then
-  cat "$tmp"
-  exit 0
-fi
-
-# Both failed. Show whatever came back so the cause is visible.
-echo "api call failed: $METHOD $PATH_" >&2
-[[ -s "$tmp" ]] && { echo "last response:" >&2; head -c 400 "$tmp" >&2; echo >&2; }
-echo "is the stack up? try: make ps" >&2
+case "$code" in
+  000|"") echo "  nothing answered on localhost:${PORT}. Is the stack up? try: make ps" >&2 ;;
+  401|403) echo "  check HINDSIGHT_API_TENANT_API_KEY in .env" >&2 ;;
+  *)       echo "  try: make ps    and: make logs" >&2 ;;
+esac
 exit 1
