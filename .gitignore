@@ -1,0 +1,18 @@
+# Local configuration and credentials. Never commit.
+.env
+.env.*
+!.env.example
+
+# Local-only provider overlay. Keep environment-specific hostnames, token
+# commands and sentinel values out of git -- see docs/TOKEN-SHIM.md section 8.
+scripts/*-shim.py
+!scripts/token-shim.py
+docs/LOCAL-*.md
+
+# Shim runtime state
+*.pid
+*.log
+scripts/__pycache__/
+
+# macOS
+.DS_Store

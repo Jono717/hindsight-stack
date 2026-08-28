@@ -1,0 +1,148 @@
+# Hindsight memory stack: two containers, PostgreSQL + Hindsight.
+#
+# Derived from the upstream external-pg example, with four deliberate changes:
+#   1. PGDATA is pinned to /var/lib/postgresql/data. The upstream example mounts
+#      the volume at /var/lib/postgresql/${VERSION}/docker, which is only correct
+#      for the pg18 image -- Postgres 18 moved the default PGDATA. Setting PGDATA
+#      explicitly makes the volume path correct for every image version.
+#   2. A ghcr.io Postgres image instead of Docker Hub's pgvector/pgvector,
+#      because docker.io is blocked on this network. See docs/REGISTRY.md.
+#   3. The db has a healthcheck and hindsight waits on it. Without this the API
+#      races Postgres on a cold start and the first `up` usually fails migrations.
+#   4. Ports bind to 127.0.0.1 only. This stack holds an LLM credential and every
+#      memory you retain; it should not be reachable from the network.
+#
+# Usage:
+#   cp .env.example .env    # then edit it
+#   make up
+#
+# See README.md for the walkthrough and docs/TOKEN-SHIM.md for providers whose
+# credential expires.
+
+name: hindsight-stack
+
+services:
+  db:
+    # NOT pgvector/pgvector, which is what upstream uses. Docker Hub was blocked
+    # on the network this was built on: the Colima daemon routed through a host
+    # proxy that returns 403 for docker.io while allowing ghcr.io. Override with
+    # HINDSIGHT_DB_IMAGE if Docker Hub works for you. See docs/REGISTRY.md.
+    #
+    # This image is built on the official postgres base, so it keeps the standard
+    # docker-entrypoint.sh (POSTGRES_USER / POSTGRES_PASSWORD / initdb.d all
+    # behave normally) and ships `vector`, `vchord` and `pg_trgm`.
+    # Verified on 2026-08-27: CREATE EXTENSION vector succeeds, PGDATA honored.
+    image: ${HINDSIGHT_DB_IMAGE:-ghcr.io/tensorchord/vchord-postgres:pg17-v0.4.3}
+    container_name: hindsight-db
+    restart: unless-stopped
+    # Docker gives a container 64 MB of /dev/shm. Postgres allocates shared memory
+    # segments there for parallel query workers, and once there is enough data to
+    # plan a parallel scan it asks for ~61 MB in one segment and fails with
+    # "could not resize shared memory segment ... No space left on device".
+    # That message points at disk, which is misleading -- the disk had 83 GB free.
+    # Hit while creating a bank on 2026-08-28.
+    shm_size: 1gb
+    environment:
+      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in .env}
+      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight_db}
+      # Version-independent data path -- see note 1 above.
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Runs once, on first initialisation of an empty volume only. Enabling the
+      # extensions here is belt-and-braces: Hindsight's migrations create them
+      # too, and POSTGRES_USER is a superuser so it has the rights either way.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight_user} -d ${HINDSIGHT_DB_NAME:-hindsight_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # Uncomment to reach the database from the host with psql / a GUI client.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    networks:
+      - hindsight-net
+
+  hindsight:
+    # Full image: bundles the local BGE embedder and MiniLM cross-encoder, so the
+    # only external dependency is the LLM. ~3.7 GB on arm64, ~9 GB on amd64.
+    # For the ~500 MB slim image see docs/SLIM.md -- it needs external embedding
+    # AND reranker providers configured, it is not a drop-in swap.
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-latest}
+    container_name: hindsight-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HINDSIGHT_API_PORT:-8888}:8888" # API
+      - "127.0.0.1:${HINDSIGHT_CP_PORT:-9999}:9999"  # Control Plane (web UI)
+    environment:
+      HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in .env}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
+      HINDSIGHT_API_VECTOR_EXTENSION: ${HINDSIGHT_API_VECTOR_EXTENSION:-pgvector}
+
+      # A stable worker identity. Defaults to the container hostname, which Docker
+      # sets to the container ID -- so it changes on every recreate and any task
+      # in flight at shutdown stays parked under an ID nothing recognises.
+      HINDSIGHT_API_WORKER_ID: ${HINDSIGHT_API_WORKER_ID:-hindsight-local}
+
+      # LLM. Required. See .env.example for the provider matrix.
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:?set HINDSIGHT_API_LLM_PROVIDER in .env}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:?set HINDSIGHT_API_LLM_MODEL in .env}
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL:-}
+
+      # Point the bundled Control Plane at the API inside the container.
+      HINDSIGHT_CP_DATAPLANE_API_URL: http://localhost:8888
+      # Optional shared secret gating the web UI login.
+      HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:-}
+
+      # Enables POST /v1/default/banks/{bank}/health/llm, which does one real
+      # round trip to the configured LLM and reports the actual error. Off by
+      # default upstream. Worth having: without it, a broken LLM shows up only as
+      # a failed retain or as silently missing memories. See `make check-llm`.
+      HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH: "true"
+
+      # ── API authentication ───────────────────────────────────────────────
+      # Hindsight ships unauthenticated. This turns on the built-in API-key
+      # extension, which gates EVERY endpoint, not just /mcp. Clients send
+      # `Authorization: Bearer <key>` (a bare key without the prefix also works).
+      #
+      # ApiKeyTenantExtension.authenticate_mcp() delegates to authenticate(), so
+      # one key covers the REST API and MCP. Do NOT set
+      # HINDSIGHT_API_TENANT_MCP_AUTH_DISABLED -- that would exempt MCP, which is
+      # the surface with retain/delete/clear on it.
+      HINDSIGHT_API_TENANT_EXTENSION: ${HINDSIGHT_API_TENANT_EXTENSION:-}
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY:-}
+
+      # The Control Plane is an API client like any other. Once the API is
+      # key-protected the CP must present the same key or the dashboard breaks.
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY:-}
+    healthcheck:
+      # /health checks the database too; /health/live is process-only.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Generous: a cold start loads the embedder and reranker into memory and
+      # runs migrations before it will answer.
+      start_period: 180s
+    depends_on:
+      db:
+        condition: service_healthy
+    # Lets the container resolve `host.docker.internal` to the machine running
+    # Docker. Needed only by the token-shim path (docs/TOKEN-SHIM.md); harmless
+    # otherwise. Under Colima the "host" is the Lima VM, not the workstation --
+    # `make preflight` checks whether the shim is actually reachable.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - hindsight-net
+
+networks:
+  hindsight-net:
+    driver: bridge
+
+volumes:
+  pg_data:
