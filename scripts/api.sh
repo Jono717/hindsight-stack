@@ -100,20 +100,29 @@ attempt_host() {
   fi
 }
 
+# There is no second file to write the status to inside the container, so body and
+# status share one stream and are split back apart here. Capture that stream into a
+# variable FIRST: piping it into `{ body=$(sed '$d'); code=$(tail -n1); }` reads the
+# same pipe twice, and `sed` must consume all of stdin to know which line is last,
+# so `tail` always saw an exhausted pipe and `code` was always empty. That failed
+# status_ok on every call, making this fallback unable to succeed -- and an empty
+# code also lands on the "nothing answered" branch below, so a request that in fact
+# returned 200 was reported as the stack being down.
 attempt_container() {
+  local out
   if [[ -n "$BODY" ]]; then
-    printf '%s' "$BODY" | docker compose exec -T hindsight \
+    out=$(printf '%s' "$BODY" | docker compose exec -T hindsight \
       curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" \
       "${AUTH[@]}" \
       -H 'Content-Type: application/json' --data-binary @- \
-      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null \
-      | { body=$(sed '$d'); code=$(tail -n1); printf '%s' "$body" >"$tmp"; printf '%s' "$code" >"$code_file"; }
+      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null)
   else
-    docker compose exec -T hindsight \
+    out=$(docker compose exec -T hindsight \
       curl -sS -m 300 -X "$METHOD" "http://localhost:8888${PATH_}" "${AUTH[@]}" \
-      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null \
-      | { body=$(sed '$d'); code=$(tail -n1); printf '%s' "$body" >"$tmp"; printf '%s' "$code" >"$code_file"; }
+      -o /dev/stdout -w '\n%{http_code}' 2>/dev/null)
   fi
+  printf '%s' "$(sed '$d' <<<"$out")" >"$tmp"
+  printf '%s' "$(tail -n1 <<<"$out")" >"$code_file"
 }
 
 status_ok() {
